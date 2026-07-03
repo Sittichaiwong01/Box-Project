@@ -1,0 +1,923 @@
+SkR00 DOCUMENT EXTRACTION DRAFT
+Document: Everything That Actually Matters for Local AI
+Source: YouTube Article
+Mode: Article only / no video download
+Standard: SkR00 / MEM00 Document Extraction Standard
+Purpose: สกัดข้อมูลจากบทความ Local AI ให้เป็นข้อมูล compact,
+structured, reusable โดยไม่ตัด logic สำคัญออก
+
+
+============================================================
+1. HEADER / CONTEXT
+============================================================
+
+เอกสารนี้อธิบายหลักการสำคัญที่มีผลจริงต่อการใช้งาน Local AI
+บนเครื่องส่วนตัว โดยเน้นการตัดสินใจเชิงเทคนิคว่าโมเดลใดเหมาะกับ
+ฮาร์ดแวร์ใด ควรเลือก quantization แบบไหน ควรใช้ engine หรือ wrapper
+อย่างไร VRAM/RAM/CPU/PCI มีผลต่อ performance อย่างไร และทำไม
+การรันโมเดลบนเครื่องตัวเองจึงไม่ใช่แค่เรื่องประหยัดค่า cloud แต่คือ
+การครอบครองสติปัญญาและข้อมูลของตนเอง
+
+แกนหลักของเอกสารคือ:
+- การเลือกโมเดลต้องดูทั้ง “พอดีกับเครื่องหรือไม่” และ
+  “เร็วพอสำหรับงานจริงหรือไม่”
+- VRAM ไม่ใช่ตัวแปรเดียว ต้องดู RAM, CPU, model type,
+  active parameters, KV cache และ engine ที่ใช้
+- Quantization คือหัวใจที่ทำให้รันโมเดลใหญ่บนเครื่องเล็กได้
+- Dense model กับ MoE model ใช้ logic การกินทรัพยากรต่างกัน
+- llama.cpp ให้การควบคุมลึกกว่า wrapper เช่น Ollama / LM Studio
+- ผู้ใช้ควรเริ่มจากฮาร์ดแวร์ที่มีอยู่ก่อน แล้วค่อยอัปเกรด
+- เป้าหมายสุดท้ายคือ Local AI ที่ใช้งานจริงบนเครื่องที่ผู้ใช้เป็นเจ้าของ
+
+
+============================================================
+2. SYSTEM COMPONENTS
+============================================================
+
+
+------------------------------------------------------------
+2.1 Local AI Decision Framework
+------------------------------------------------------------
+
+Local AI Decision Framework คือกรอบตัดสินใจว่าโมเดลใดเหมาะกับเครื่อง
+และงานของผู้ใช้ โดยไม่เลือกจากคำแนะนำแบบเดาสุ่ม
+
+คำถามหลักมี 2 ข้อ:
+1. โมเดลนี้ fit กับระบบหรือไม่
+   - VRAM พอหรือไม่
+   - RAM ระบบพอหรือไม่
+   - context/KV cache กินพื้นที่เพิ่มเท่าไร
+
+2. โมเดลนี้เร็วพอสำหรับงานจริงหรือไม่
+   - token generation เร็วพอหรือไม่
+   - offload แล้วช้าเกินไปหรือไม่
+   - dense หรือ MoE เหมาะกว่า
+   - engine ที่ใช้มีผลต่อความเร็วหรือไม่
+
+Relational Logic:
+- IF โมเดลใส่ VRAM ได้แต่ช้ามาก THEN ยังไม่เหมาะกับงานจริง
+- IF โมเดลใหญ่เกิน VRAM แต่เป็น MoE และ active parameters ต่ำ
+  THEN อาจยังรันได้ดีด้วย CPU/RAM offload
+- IF ผู้ใช้ไม่รู้ parameter / quant / context / engine THEN จะเลือกโมเดล
+  แบบเดาและมักใช้ฮาร์ดแวร์ไม่เต็มศักยภาพ
+
+
+------------------------------------------------------------
+2.2 Model Parameters
+------------------------------------------------------------
+
+Parameter คือจำนวนการเชื่อมต่อในสมองดิจิทัลของโมเดล เช่น:
+- 8B
+- 13B
+- 30B
+- 35B
+- 40B
+- 117B / 120B class
+
+Parameter เป็นตัวบอก scale ของโมเดล แต่ไม่ได้บอกทั้งหมดว่า
+โมเดลจะกิน VRAM เท่าไร เพราะต้องดู quantization, context,
+KV cache และ model type ด้วย
+
+สูตรคร่าว ๆ:
+Model memory ≈ parameter count × bytes per parameter + context overhead
+
+ตัวอย่าง:
+- 8B ที่ 4-bit quantization ใช้ประมาณครึ่งไบต์ต่อ parameter
+- 8B × 0.5 byte ≈ 4GB model weights
+- รวม context แล้วอาจใช้ประมาณ 5GB
+
+Relational Logic:
+- IF model เป็น BF16 THEN ใช้ประมาณ 2 bytes ต่อ parameter
+- IF model เป็น Q8 THEN ใช้ประมาณ 1 byte ต่อ parameter
+- IF model เป็น Q4 THEN ใช้ประมาณ 0.5 byte ต่อ parameter
+- IF 8B BF16 THEN ต้องการประมาณ 16GB เฉพาะ weights
+- IF 8B Q4 THEN weights เหลือประมาณ 4GB
+
+
+------------------------------------------------------------
+2.3 VRAM
+------------------------------------------------------------
+
+VRAM คือหน่วยความจำบน GPU ที่ใช้เก็บ model weights,
+KV cache และข้อมูลประมวลผลสำคัญระหว่าง inference
+
+บทบาท:
+- สำคัญมากสำหรับ dense model
+- เป็นข้อจำกัดแบบ “หน้าผา” สำหรับ dense model
+- ถ้า dense model เริ่ม offload ออกจาก VRAM ความเร็วจะตกหนัก
+- VRAM มากช่วยให้ใช้โมเดล dense ใหญ่ขึ้นได้
+
+ตัวอย่างจากเอกสาร:
+- RTX 3060 12GB ใช้เป็น baseline
+- การ์ด 6GB / 8GB / 12GB / 24GB ยังใช้งานได้ถ้าเลือกโมเดลถูก
+- 12GB โดยทั่วไปเหมาะกับโมเดลประมาณ 8B-13B แบบ dense
+- 16GB เช่น RTX 5060 Ti 16GB เป็นตัวเลือกที่ดีขึ้น
+- Tesla P40 24GB ดูดีบนกระดาษ แต่มีข้อจำกัดเพราะเป็น Pascal,
+  ไม่มี Tensor Core และต้องการ cooling ดี
+
+Relational Logic:
+- IF ใช้ dense model THEN ซื้อ VRAM ให้มากที่สุดเท่าที่งบไหว
+- IF ใช้ MoE offload บน llama.cpp THEN VRAM มากขึ้นมี diminishing returns
+- IF VRAM น้อย THEN ต้องเลือก quantization ต่ำลง หรือใช้ MoE/offload
+- IF GPU ใหม่แรงแต่ VRAM น้อย THEN อาจแพ้ GPU เก่า VRAM มากในงาน LLM
+
+
+------------------------------------------------------------
+2.4 System RAM
+------------------------------------------------------------
+
+System RAM คือ RAM หลักของเครื่อง ใช้สำคัญมากเมื่อรัน MoE แบบ offload
+โดยเฉพาะใน llama.cpp
+
+บทบาท:
+- เก็บ expert weights หรือส่วนที่ไม่ได้อยู่ใน VRAM
+- มีผลมากกับ MoE offload
+- RAM bandwidth สำคัญมากกว่า PCIe bandwidth ใน offload style ของ
+  llama.cpp
+- RAM 64GB สามารถเปิดทางให้รันโมเดล MoE ใหญ่กว่าที่ VRAM ล้วนรองรับ
+
+Relational Logic:
+- IF ใช้ MoE offload ด้วย llama.cpp THEN RAM bandwidth สำคัญมาก
+- IF system RAM มากและเร็ว THEN สามารถใช้โมเดล MoE ใหญ่ขึ้นได้
+- IF RAM ไม่พอ THEN ต่อให้ active parameter ต่ำก็อาจโหลดโมเดลไม่ได้
+
+
+------------------------------------------------------------
+2.5 CPU
+------------------------------------------------------------
+
+CPU มีบทบาทสำคัญใน MoE offload โดยเฉพาะเมื่อ expert บางส่วนถูกวางไว้
+บน CPU
+
+บทบาท:
+- ประมวลผล expert layer ที่ใช้ memory มากแต่ compute ต่ำกว่า
+- ทำงานร่วมกับ GPU ที่ดูแล attention layer
+- CPU ที่ดีพอช่วยให้ MoE offload ใช้งานจริงได้
+
+Relational Logic:
+- IF MoE active experts เล็ก THEN CPU สามารถประมวลผลส่วนนั้นได้ดี
+- IF CPU ช้าเกินไป THEN MoE offload อาจไม่ลื่น
+- IF ใช้ dense model เต็ม GPU THEN CPU สำคัญน้อยกว่า VRAM/GPU bandwidth
+
+
+------------------------------------------------------------
+2.6 PCIe Bandwidth
+------------------------------------------------------------
+
+PCIe bandwidth มีผลต่างกันตาม engine และวิธี offload
+
+ใน llama.cpp MoE offload:
+- weight expert อยู่บน CPU/RAM
+- ไม่ต้องส่ง weights ใหญ่ผ่าน PCIe ตลอดเวลา
+- มีเพียง activation เล็ก ๆ ที่เคลื่อนที่
+- PCIe จึงไม่ใช่คอขวดหลัก
+
+ใน engine เช่น vLLM:
+- offloaded weights อาจถูกส่งกลับไป GPU ผ่าน PCIe
+- PCIe เริ่มสำคัญมาก
+- ถ้าแบ่งโมเดลสอง GPU หรือ offload แบบส่ง weight ผ่าน PCIe
+  อาจเกิด bottleneck
+
+Relational Logic:
+- IF ใช้ llama.cpp MoE offload THEN RAM bandwidth > CPU > PCIe
+- IF ใช้ vLLM offload THEN PCIe bandwidth สำคัญขึ้น
+- IF engine ต่างกัน THEN hardware bottleneck ก็ต่างกัน
+
+
+------------------------------------------------------------
+2.7 Context / KV Cache
+------------------------------------------------------------
+
+Context คือหน่วยความจำระยะสั้นของโมเดล เก็บคำสั่ง บทสนทนา
+และสิ่งที่เกิดขึ้นก่อนหน้าเพื่อใช้สร้าง token ต่อไป
+
+KV cache คือโครงสร้างข้อมูลที่ทำให้โมเดลไม่ต้องอ่าน context ทั้งหมดซ้ำ
+ทุกครั้งที่สร้าง token ใหม่
+
+บทบาท:
+- ยิ่ง context ยาว ยิ่งกิน VRAM/RAM
+- context ระยะยาวอาจกิน memory มากกว่า model weights
+- ตัวเลข context ที่โมเดลโฆษณา เช่น 262K หรือ 1M token
+  ไม่ได้แปลว่าใช้ได้จริงบนการ์ด 12GB
+
+KV Cache Quantization:
+- ลดบิตของ KV cache เพื่อประหยัด memory
+- Q8 KV cache ใช้พื้นที่น้อยลงประมาณครึ่งหนึ่ง
+- Q8 แทบไม่เสียคุณภาพมาก
+- ต่ำกว่า Q8 เริ่มกระทบ reasoning ใน long context
+
+Relational Logic:
+- IF context ยาวขึ้น THEN KV cache กิน memory เพิ่ม
+- IF ใช้ KV cache quantization THEN ลด memory ได้
+- IF ลด KV cache ต่ำเกินไป THEN long-context reasoning แย่ลง
+- IF card 12GB THEN context จริงอาจใช้งานได้ราว 64K token
+  มากกว่าตัวเลข lab claim ไม่ได้เสมอ
+
+
+------------------------------------------------------------
+2.8 Engine
+------------------------------------------------------------
+
+Engine คือส่วนที่ทำงานหนักจริงในการ inference โมเดล
+
+ตัวอย่าง:
+- llama.cpp
+- vLLM
+
+บทบาท:
+- โหลดโมเดล
+- รัน deep learning kernels
+- สร้าง token output
+- ควบคุม offload, layer placement, memory behavior
+- ให้ control ระดับลึกกว่าตัว wrapper
+
+llama.cpp:
+- เป็น open-source engine
+- เป็นฐานของหลาย wrapper
+- เหมาะกับผู้ใช้คนเดียว / budget GPU
+- รองรับ NGL
+- รองรับ tensor override
+- รองรับ CPU/GPU split
+- ใช้ควบคุม MoE offload ได้ละเอียด
+
+vLLM:
+- เหมาะเมื่อมีทีม / การ์ดใหญ่ / serving scale
+- offload behavior อาจทำให้ PCIe สำคัญกว่า llama.cpp
+
+Relational Logic:
+- IF ต้องการ control ลึก THEN ใช้ engine โดยตรง
+- IF เป็น single-user budget GPU THEN llama.cpp เพียงพอ
+- IF ต้อง serve หลายผู้ใช้หรือหลาย GPU ใหญ่ THEN พิจารณา vLLM
+- IF engine ต่างกัน THEN offload strategy และ bottleneck ต่างกัน
+
+
+------------------------------------------------------------
+2.9 Wrapper
+------------------------------------------------------------
+
+Wrapper คือโปรแกรมที่ครอบ engine เพื่อให้ใช้งานง่ายขึ้น
+
+ตัวอย่าง:
+- Ollama
+- LM Studio
+
+บทบาท:
+- ติดตั้งง่าย
+- มี UI หรือ command ใช้งานง่าย
+- ซ่อนรายละเอียด engine
+- เหมาะกับการเริ่มต้น
+
+ข้อจำกัด:
+- อาจลดความยืดหยุ่น
+- อาจทำให้ผู้ใช้ไม่เรียนรู้ layer ล่าง
+- อาจกลายเป็นเพดานของการพัฒนา Local AI
+- บางตัวเป็น proprietary หรือเปลี่ยนทิศทางไปทาง cloud
+
+Ollama:
+- เป็น wrapper ยอดนิยมที่ใช้ llama.cpp
+- เอกสารกล่าวว่าชุมชนบางส่วนไม่พอใจเรื่องการเปลี่ยนทิศทาง
+  ไป cloud / UI closed-source / การ credit llama.cpp
+
+LM Studio:
+- GUI ใช้งานง่าย
+- ครอบ llama.cpp
+- proprietary แต่ใช้งานฟรีในช่วงปัจจุบัน
+
+Relational Logic:
+- IF เพิ่งเริ่ม Local AI THEN wrapper ช่วยให้เริ่มง่าย
+- IF ต้อง optimize จริงจัง THEN ต้องลงไปใช้ engine layer
+- IF ยึดติด wrapper เกินไป THEN จะถูกจำกัดความสามารถ
+- IF ใช้ llama.cpp โดยตรง THEN control อยู่กับผู้ใช้มากกว่า
+
+
+------------------------------------------------------------
+2.10 NGL / GPU Layer Offload
+------------------------------------------------------------
+
+NGL คือ parameter ใน llama.cpp ที่ใช้กำหนดจำนวน layer ที่ offload ไป GPU
+
+บทบาท:
+- แบ่งโมเดลระหว่าง GPU และ CPU
+- ใช้งานง่ายกว่าการกำหนด tensor รายตัว
+- เหมาะกับการทดลองเบื้องต้น
+
+ข้อจำกัด:
+- เป็นการควบคุมแบบหยาบ
+- ไม่แม่นเท่า tensor override
+
+Relational Logic:
+- IF ต้องการ split โมเดลแบบง่าย THEN ใช้ NGL
+- IF ต้องการ optimize เฉพาะ layer/tensor THEN ใช้ tensor override
+
+
+------------------------------------------------------------
+2.11 Tensor Override
+------------------------------------------------------------
+
+Tensor override คือการเลือก tensor เฉพาะด้วยชื่อหรือ regex
+เพื่อกำหนดว่าควรอยู่ CPU หรือ GPU
+
+บทบาท:
+- วาง layer ที่ compute สูงแต่ memory ต่ำไว้บน GPU
+- วาง layer ที่ memory สูงแต่ compute ต่ำไว้บน CPU
+- เพิ่มความแม่นยำในการ optimize
+- สำคัญมากกับ MoE offload
+
+Relational Logic:
+- IF attention layer ใช้ compute สูงแต่ memory ต่ำ THEN วางบน GPU
+- IF expert layer ใช้ memory สูงแต่ compute ต่ำ THEN วางบน CPU
+- IF ต้องการ performance ดีบน hardware จำกัด THEN tensor placement สำคัญมาก
+
+
+------------------------------------------------------------
+2.12 Quantization
+------------------------------------------------------------
+
+Quantization คือการลดจำนวน bit ที่ใช้เก็บ parameter ของโมเดล
+เพื่อให้โมเดลเล็กลงและรันบน VRAM น้อยลง
+
+พื้นฐาน:
+- 8 bits = 1 byte
+- BF16 = 16-bit = 2 bytes ต่อ parameter
+- Q8 ≈ 8-bit = 1 byte ต่อ parameter
+- Q4 ≈ 4-bit = 0.5 byte ต่อ parameter
+
+ผล:
+- BF16 → Q8 ลดขนาดประมาณครึ่งหนึ่ง
+- BF16 → Q4 ลดขนาดประมาณหนึ่งในสี่
+- Q4 ยังรักษาคุณภาพได้ดีมาก
+- ต่ำกว่า Q4 เช่น Q3/Q2 คุณภาพเริ่มตกเร็ว
+
+Relational Logic:
+- IF ต้องการ baseline ที่ปลอดภัย THEN ใช้ Q4_K_M
+- IF มี VRAM เหลือ THEN ทดลอง Q5/Q6
+- IF VRAM จำกัดมาก THEN ใช้ IQ หรือ Unsloth dynamic
+- IF ลด quant ต่ำเกินไป THEN reasoning/model quality เสีย
+
+
+------------------------------------------------------------
+2.13 GGUF
+------------------------------------------------------------
+
+GGUF คือ format ที่ llama.cpp ใช้สำหรับโมเดล local
+
+บทบาท:
+- เป็น format ที่เหมาะกับ llama.cpp
+- ใช้กับ budget GPU ได้ดีกว่า safetensors ในบริบทนี้
+- มักพบใน Hugging Face พร้อมหลาย quantization
+
+Relational Logic:
+- IF ใช้ llama.cpp THEN เลือก GGUF
+- IF ใช้ budget GPU THEN เลือก GGUF quantized model
+- IF ดาวน์โหลด safetensors โดยไม่จำเป็น THEN อาจใช้งานยากกว่าใน local setup นี้
+
+
+------------------------------------------------------------
+2.14 Quantization Labels
+------------------------------------------------------------
+
+ตัวอย่าง label:
+- Q4_K_M
+- Q5_K_S
+- Q8
+- IQ4
+- Unsloth Dynamic / UB
+
+ความหมาย:
+- Q4/Q5/Q8 = จำนวน bit ต่อ weight โดยประมาณ
+- K = K-quant เป็น quantization ที่ฉลาดกว่าเดิม
+- S/M/L = จำนวน layer ที่ถูกยกขึ้นไปใช้ bit สูงขึ้น
+  - S = small
+  - M = medium / balanced
+  - L = large
+- IQ = Importance Matrix quantization ใช้ I-matrix + lookup table
+- UB / Unsloth Dynamic = รูปแบบ dynamic quantization ของ Unsloth
+
+Rule:
+- Q4_K_M เป็น default ที่ปลอดภัยที่สุด
+- Q4 เป็นจุดสมดุลคุณภาพ/ขนาด
+- Q5/Q6 ใช้เมื่อมี VRAM เหลือ
+- IQ ใช้เมื่อ VRAM จำกัดมากและยอมเสีย speed บ้าง
+- Q3/Q2 ใช้ด้วยความระวัง เพราะคุณภาพตกเร็ว
+
+Relational Logic:
+- IF ไม่รู้จะเลือก quant อะไร THEN เริ่ม Q4_K_M
+- IF Q4_K_M fit และเร็วพอ THEN ไม่จำเป็นต้องสูงขึ้น
+- IF ต้องการคุณภาพเพิ่มและมี VRAM เหลือ THEN ลอง Q5/Q6
+- IF model ไม่ fit THEN ลดไป IQ/Unsloth dynamic ก่อนลดไป Q3/Q2
+
+
+------------------------------------------------------------
+2.15 Dense Model
+------------------------------------------------------------
+
+Dense model คือโมเดลที่ activate parameter/neurons ส่วนใหญ่หรือทั้งหมด
+ทุก token
+
+คุณสมบัติ:
+- ต้องการ VRAM สูง
+- performance ดีเมื่ออยู่บน GPU เต็ม
+- offload แล้วความเร็วตกมาก
+- VRAM เป็นข้อจำกัดสำคัญที่สุด
+
+Relational Logic:
+- IF ใช้ dense model THEN VRAM คือปัจจัยหลัก
+- IF dense model ไม่ fit VRAM THEN offload จะทำให้ช้าลงมาก
+- IF ต้องการ dense model ใหญ่ THEN ซื้อ GPU VRAM มากคุ้มกว่า
+- IF VRAM จำกัด THEN เลือก dense model เล็กลงหรือ quant ต่ำลง
+
+
+------------------------------------------------------------
+2.16 MoE Model
+------------------------------------------------------------
+
+MoE หรือ Mixture of Experts คือโมเดลที่มี parameter รวมสูง
+แต่เปิดใช้งานเพียงบางส่วนต่อ token
+
+คุณสมบัติ:
+- total parameters สูงได้ เช่น 30B / 35B / 117B
+- active parameters ต่ำกว่า total parameters มาก
+- ความเร็วขึ้นกับ active parameters มากกว่า total parameters
+- สามารถ offload expert layers ไป CPU/RAM ได้
+- attention layers อยู่ GPU เพื่อรักษาความเร็ว
+
+ตัวอย่างแนวคิด:
+- 30B MoE อาจ active จริงเพียง 3B
+- 117B MoE อาจ active จริงประมาณ 5B
+- 30B MoE active ต่ำอาจฉลาดกว่า/เร็วพอ ๆ กับ 14B dense
+- GPU 8GB + RAM 64GB อาจรัน MoE ใหญ่ได้ ถ้า active parameter ต่ำ
+
+Relational Logic:
+- IF total parameter ใหญ่แต่ active parameter ต่ำ THEN ยังรันได้จริง
+- IF active parameter สูงเกินไป THEN ประโยชน์ของ MoE ลดลง
+- IF expert layer memory สูงแต่ compute ต่ำ THEN วางบน CPU/RAM
+- IF attention layer compute สูงแต่ memory ต่ำ THEN วางบน GPU
+- IF ใช้ llama.cpp offloaded MoE THEN GPU ไม่ต้องเก็บ weights ทั้งหมด
+
+
+------------------------------------------------------------
+2.17 Active Parameters
+------------------------------------------------------------
+
+Active parameters คือจำนวน parameter ที่ถูกใช้งานจริงต่อ token
+ใน MoE model
+
+บทบาท:
+- เป็นตัวชี้ speed สำคัญกว่า total parameters สำหรับ MoE
+- ใช้ประเมิน VRAM/CPU/RAM workload
+- ใช้บอกว่า MoE ใหญ่จะรันได้จริงหรือไม่
+
+Relational Logic:
+- IF active parameters ต่ำ THEN MoE ใหญ่ยังอาจเร็ว
+- IF active parameters สูง THEN MoE อาจช้าและกินทรัพยากรมาก
+- IF เปรียบเทียบ MoE กับ dense THEN อย่าดู total parameter อย่างเดียว
+
+
+------------------------------------------------------------
+2.18 Model Selection by Task
+------------------------------------------------------------
+
+การเลือกโมเดลควรเลือกตามงาน ไม่ใช่เลือกโมเดลเดียวทำทุกอย่าง
+
+ประเภท:
+1. Generalist model
+   - ใช้สนทนาทั่วไป
+   - จัดการงานพื้นฐาน
+   - ใช้เป็น default chat model
+
+2. Specialist model
+   - Coding
+   - OCR
+   - Vision
+   - RAG embedding
+   - Agent workflow
+   - Writing
+
+หลักการ:
+- โมเดล specialist ขนาดเล็กอาจชนะ generalist ขนาดใหญ่ในงานเฉพาะ
+- OCR model เล็กอาจอ่านข้อความ PDF ได้เร็วกว่า vision model ใหญ่
+- ควรมีหลายโมเดลและสลับตามงาน
+
+Relational Logic:
+- IF งานเป็น general chat THEN ใช้ generalist
+- IF งานเป็น coding THEN ใช้ coding model
+- IF งานเป็น OCR THEN ใช้ OCR model
+- IF งานเป็น vision/chart/screenshot THEN ใช้ vision model
+- IF งานเป็น RAG THEN ใช้ embedding model ที่เหมาะกับ retrieval
+
+
+------------------------------------------------------------
+2.19 Hugging Face Download Rules
+------------------------------------------------------------
+
+ก่อนดาวน์โหลดโมเดลจาก Hugging Face ต้องตรวจ:
+
+1. Base vs Instruct/Chat
+   - Base model เติมข้อความต่อ ไม่ได้ตอบคำถามแบบผู้ช่วย
+   - Instruct/Chat model เหมาะกับการใช้งานถามตอบ
+
+2. Quantizer / Publisher
+   - เลือกคนหรือ repo ที่ทำ quantization ดี
+   - ตัวอย่างที่กล่าวถึง:
+     - Bartowski
+     - Unsloth
+     - Mradermacher
+     - official repository
+
+3. Format
+   - ใช้ GGUF สำหรับ llama.cpp
+   - ไม่เลือก safetensors ถ้าเป้าคือ budget local llama.cpp
+
+4. Context claim
+   - อย่าเชื่อ context length ที่ประกาศเต็ม ๆ
+   - 262K / 1M token อาจเป็น lab number
+   - เครื่องจริง 12GB อาจใช้ได้ประมาณ 64K token เมื่อจัด KV cache ดี
+
+5. License
+   - Open weights ไม่ได้แปลว่า open-source เสมอ
+   - ใช้ส่วนตัว/home lab มักไม่เป็นปัญหา
+   - เชิงพาณิชย์ต้องตรวจ license ให้ชัด
+
+Relational Logic:
+- IF model name ไม่มี instruct/chat THEN อาจเป็น base model
+- IF ใช้ผิด base model THEN โมเดลจะเติมข้อความ ไม่ใช่ตอบคำถาม
+- IF ใช้เชิงพาณิชย์ THEN ต้องตรวจ license
+- IF ใช้ llama.cpp THEN เลือก GGUF
+- IF quantizer ไม่น่าเชื่อถือ THEN model quality อาจแย่
+
+
+------------------------------------------------------------
+2.20 Hardware Buying Logic
+------------------------------------------------------------
+
+การซื้อ hardware ต้องขึ้นกับ model strategy:
+
+Strategy A: Dense Model
+- VRAM สำคัญที่สุด
+- GPU VRAM มากดีกว่า GPU ใหม่แต่ VRAM น้อย
+- Dense model offload แล้วช้ามาก
+- ซื้อ VRAM ให้มากที่สุดเท่าที่งบไหว
+
+Strategy B: MoE Offload
+- ต้อง balance VRAM + RAM + CPU
+- VRAM มากเกินไปมี diminishing returns
+- RAM bandwidth สำคัญมาก
+- CPU ต้องดีพอ
+- PCIe สำคัญน้อยใน llama.cpp MoE offload
+
+Recommendation จากเอกสาร:
+- RTX 3060 12GB เป็น sweet spot ราคาประหยัด
+- RTX 5060 Ti 16GB เป็นตัวเลือกใหญ่ขึ้น
+- Tesla P40 24GB ไม่ควรดูแค่ VRAM เพราะไม่มี Tensor Core,
+  เป็น Pascal เก่า และต้องมี cooling ดีมาก
+
+Relational Logic:
+- IF ยังไม่ได้ลองของเดิม THEN อย่าเพิ่งซื้อใหม่
+- IF hardware เดิมตอบโจทย์ 90% THEN ใช้ของเดิมก่อน
+- IF ต้อง dense model ใหญ่ THEN ลงทุน VRAM
+- IF ต้อง MoE ใหญ่แบบ offload THEN ลงทุน RAM เร็ว + CPU ดี
+
+
+============================================================
+3. OPERATIONS WORKFLOW
+============================================================
+
+
+------------------------------------------------------------
+3.1 Workflow: ประเมินว่าโมเดล fit เครื่องหรือไม่
+------------------------------------------------------------
+
+1. ตรวจจำนวน parameter ของโมเดล
+2. ตรวจ quantization เช่น BF16, Q8, Q4, Q4_K_M, IQ
+3. คำนวณคร่าว ๆ:
+   parameter count × bytes per parameter + context overhead
+4. ตรวจ VRAM ที่มีจริง
+5. ประเมิน context/KV cache ที่จะใช้
+6. ถ้าไม่ fit:
+   - ลด quantization
+   - ใช้ KV cache quantization
+   - ลด context
+   - เลือกโมเดลเล็กลง
+   - เลือก MoE active parameter ต่ำ
+   - ใช้ CPU/RAM offload
+
+Success Criteria:
+- โมเดลโหลดได้
+- ไม่ชน VRAM/RAM limit
+- context ที่ตั้งไว้ใช้งานได้จริง
+
+
+------------------------------------------------------------
+3.2 Workflow: เลือก Quantization
+------------------------------------------------------------
+
+1. เริ่มจาก Q4_K_M เป็น default
+2. ถ้า VRAM เหลือและต้องการคุณภาพเพิ่ม:
+   - ลอง Q5
+   - ลอง Q6
+3. ถ้า VRAM ไม่พอ:
+   - ลอง IQ quant
+   - ลอง Unsloth dynamic / UB
+4. หลีกเลี่ยง Q3/Q2 เว้นแต่จำเป็นจริง
+5. ทดสอบ quality กับงานจริง ไม่ดูแค่ benchmark
+
+Success Criteria:
+- โมเดล fit
+- ความเร็วรับได้
+- คุณภาพตอบไม่พัง
+- context ที่ต้องใช้ยังพอ
+
+
+------------------------------------------------------------
+3.3 Workflow: เลือก Dense หรือ MoE
+------------------------------------------------------------
+
+1. ตรวจว่าโมเดลเป็น dense หรือ MoE
+2. ถ้า dense:
+   - ดู total parameters
+   - ดู VRAM requirement
+   - หลีกเลี่ยง offload ถ้าความเร็วสำคัญ
+3. ถ้า MoE:
+   - ดู active parameters
+   - ดู RAM requirement
+   - วาง expert บน CPU/RAM
+   - วาง attention บน GPU
+4. เปรียบเทียบ performance ต่อ hardware จริง
+5. เลือกโมเดลที่เร็วพอและฉลาดพอสำหรับงาน
+
+Success Criteria:
+- Dense ใช้เมื่อ fit GPU เต็ม
+- MoE ใช้เมื่อ active parameter ต่ำและ RAM/CPU พอ
+- ไม่เลือกจาก total parameter อย่างเดียว
+
+
+------------------------------------------------------------
+3.4 Workflow: ใช้ llama.cpp เพื่อ optimize
+------------------------------------------------------------
+
+1. เริ่มจาก wrapper เพื่อใช้งานง่าย เช่น LM Studio/Ollama
+2. เมื่อเข้าใจระบบแล้ว ลงไปที่ llama.cpp
+3. ใช้ NGL เพื่อ offload layer ไป GPU แบบง่าย
+4. ถ้าต้อง optimize ลึก:
+   - ใช้ tensor override
+   - วาง attention layer บน GPU
+   - วาง expert layer บน CPU
+5. ทดสอบ speed, memory, quality
+6. บันทึก configuration ที่ใช้งานได้
+
+Success Criteria:
+- ใช้ hardware ได้เต็มขึ้น
+- ไม่ติดข้อจำกัด wrapper
+- ได้ config ที่ repeat ได้
+
+
+------------------------------------------------------------
+3.5 Workflow: เลือกโมเดลตามงาน
+------------------------------------------------------------
+
+1. แยกชนิดงาน:
+   - chat
+   - coding
+   - writing
+   - OCR
+   - vision
+   - RAG embedding
+   - agent workflow
+2. เลือก generalist สำหรับงานทั่วไป
+3. เลือก specialist สำหรับงานเฉพาะ
+4. ตรวจ instruct/chat format
+5. ตรวจ license
+6. ดาวน์โหลด GGUF quantized model จาก source ที่น่าเชื่อถือ
+7. ทดสอบกับงานจริง
+
+Success Criteria:
+- โมเดลตรงกับงาน
+- ไม่ใช้ general model ใหญ่เกินจำเป็น
+- specialist ทำงานเฉพาะได้เร็วกว่า/แม่นกว่า
+
+
+------------------------------------------------------------
+3.6 Workflow: ตัดสินใจซื้อ Hardware
+------------------------------------------------------------
+
+1. เริ่มจาก hardware ที่มีอยู่ก่อน
+2. ทดสอบ Q4_K_M model จริง
+3. ทดสอบ context จริง
+4. ทดสอบ MoE offload ถ้า RAM/CPU พอ
+5. ถ้ายังไม่พอ:
+   - dense path: เพิ่ม VRAM
+   - MoE path: เพิ่ม RAM bandwidth + CPU + VRAM พอประมาณ
+6. หลีกเลี่ยงการซื้อจากตัวเลข VRAM อย่างเดียว
+7. ตรวจ Tensor Core / architecture / cooling / driver support
+
+Success Criteria:
+- ซื้อ hardware ตาม bottleneck จริง
+- ไม่ซื้อ GPU VRAM เยอะแต่ architecture เก่าเกินจนไม่คุ้ม
+- ใช้ของเดิมให้เต็มก่อนลงทุนใหม่
+
+
+============================================================
+4. RELATIONAL LOGIC
+============================================================
+
+- IF ถามว่า “รันโมเดลนี้ได้ไหม” THEN ต้องแยกเป็น 2 คำถาม:
+  fit memory หรือไม่ และเร็วพอสำหรับงานจริงหรือไม่
+
+- IF โมเดลเป็น BF16 THEN memory สูงมากและไม่เหมาะกับ budget GPU
+
+- IF ใช้ Q4 THEN ขนาดลดลงมากแต่คุณภาพยังดีพอสำหรับงานส่วนใหญ่
+
+- IF ต่ำกว่า Q4 มาก THEN คุณภาพเริ่มตกอย่างรวดเร็ว
+
+- IF ไม่รู้จะเลือก quant ไหน THEN เริ่มที่ Q4_K_M
+
+- IF VRAM เหลือ THEN ค่อยลอง Q5/Q6
+
+- IF VRAM ไม่พอ THEN ลอง IQ หรือ Unsloth dynamic
+
+- IF context ยาว THEN KV cache อาจกิน memory มากกว่า model weights
+
+- IF ใช้ KV cache Q8 THEN ลด memory ได้มากโดยคุณภาพตกน้อย
+
+- IF ใช้ dense model THEN VRAM เป็นข้อจำกัดหลัก
+
+- IF dense model offload ไป CPU THEN speed จะตกหนัก
+
+- IF ใช้ MoE THEN ต้องดู active parameters ไม่ใช่ total parameters
+
+- IF MoE active parameters ต่ำ THEN โมเดลใหญ่สามารถรันได้บนเครื่องเล็ก
+
+- IF ใช้ llama.cpp MoE offload THEN RAM bandwidth และ CPU สำคัญมาก
+
+- IF ใช้ vLLM offload THEN PCIe bandwidth อาจเป็น bottleneck
+
+- IF ใช้ wrapper อย่างเดียว THEN ใช้งานง่ายแต่ optimize ได้น้อย
+
+- IF ใช้ llama.cpp โดยตรง THEN control สูงและปรับ hardware placement ได้
+
+- IF ใช้ NGL THEN แบ่ง layer CPU/GPU ได้แบบง่าย
+
+- IF ใช้ tensor override THEN วาง tensor/layer เฉพาะได้แม่นกว่า
+
+- IF attention layer compute สูงแต่ memory ต่ำ THEN วางบน GPU
+
+- IF expert layer memory สูงแต่ compute ต่ำ THEN วางบน CPU/RAM
+
+- IF เลือกโมเดลจาก total parameter อย่างเดียว THEN อาจตัดสินใจผิด
+
+- IF model name ไม่มี instruct/chat THEN อาจเป็น base model และไม่เหมาะกับ
+  assistant chat
+
+- IF open weights THEN ไม่ได้แปลว่าใช้เชิงพาณิชย์ได้เสมอ
+
+- IF ใช้ local AI ส่วนตัว THEN เริ่มจาก hardware ที่มีอยู่ก่อน
+
+- IF hardware เดิมตอบโจทย์ได้ 90% THEN ยังไม่จำเป็นต้องซื้อใหม่
+
+- IF ต้องใช้งานจริงระยะยาว THEN ต้องทดสอบกับ workload จริง ไม่ดูแต่ spec
+
+
+============================================================
+5. CONSTRAINTS / RULES
+============================================================
+
+- ห้ามเลือกโมเดลจาก parameter count อย่างเดียว
+- ห้ามเลือก GPU จาก VRAM อย่างเดียวโดยไม่ดู architecture / Tensor Core /
+  cooling / driver / bandwidth
+- ห้ามเชื่อ context length ที่ประกาศใน model card แบบตรง ๆ
+- ห้ามถือว่าโมเดลใหญ่กว่า = ดีกว่าเสมอ
+- ห้ามถือว่า MoE total parameter คือภาระที่ต้องรันทั้งหมดทุก token
+- ห้ามใช้ base model แทน instruct/chat model สำหรับงานผู้ช่วย
+- ห้ามยึดติด wrapper จนไม่เข้าใจ engine layer
+- ห้ามตัดสิน hardware ก่อนทดสอบเครื่องที่มีอยู่
+- ห้ามใช้ quant ต่ำเกินไปโดยไม่ตรวจคุณภาพ
+- ห้ามใช้โมเดลเชิงพาณิชย์โดยไม่อ่าน license
+- ห้ามเปรียบเทียบ dense กับ MoE โดยไม่ดู active parameters
+- ห้ามใช้ benchmark อย่างเดียว ต้องทดสอบกับงานจริง
+- ห้ามคิดว่า Local AI คือแค่ประหยัด VRAM แต่ต้องมองว่าเป็นการเป็นเจ้าของ
+  intelligence และ data
+
+
+============================================================
+6. MODEL / TOOL EXAMPLES FROM DOCUMENT
+============================================================
+
+General Local AI Stack:
+- llama.cpp
+- vLLM
+- Ollama
+- LM Studio
+- Hugging Face
+- GGUF
+
+Quantization:
+- BF16
+- Q8
+- Q6
+- Q5
+- Q4_K_M
+- Q3
+- Q2
+- IQ quant
+- Unsloth Dynamic / UB
+
+Hardware:
+- RTX 3060 12GB
+- RTX 5060 Ti 16GB
+- Tesla P40 24GB
+
+Model Types:
+- Dense model
+- MoE model
+- Generalist model
+- Specialist model
+- Coding model
+- OCR model
+- Vision model
+- Embedding model
+
+Models Mentioned:
+- Qwen 3 / Qwen coding or agent model class
+- Qwen 3.6 35B A3B / MoE style model
+- GLM 4.7 Flash
+- GPT OSS
+- Gemma 4
+- Gemma 4 12B
+- Gemma vision variants
+- Qwen/Gwen embedding model class
+
+Trusted Quant Sources Mentioned:
+- Bartowski
+- Unsloth
+- Mradermacher
+- Official repositories
+
+
+============================================================
+7. OUTPUT / STORAGE DECISION
+============================================================
+
+ควรจัดเก็บเอกสารนี้เป็น Local AI Resource ภายใน AI House
+เพราะเป็นหลักคิดกลางสำหรับการเลือกโมเดล local, การเลือก quant,
+การประเมิน VRAM/RAM/CPU, การตัดสินใจซื้อ hardware และการแยก
+dense/MoE สำหรับ BOBOman และ BlackyMan
+
+Suggested Storage:
+- AI House / LocalAI / Resource
+- หรือ MEM/Resource สำหรับ Local AI Model Selection Standard
+- หรือผูกกับ BOBOman_LocalAI เป็นเอกสารอ้างอิงการเลือกโมเดล
+
+Suggested Tags:
+#SkR00
+#LocalAI
+#ModelSelection
+#Quantization
+#GGUF
+#llamaCPP
+#VRAM
+#KVCache
+#MoE
+#DenseModel
+#ActiveParameters
+#HardwarePlanning
+#BOBOman
+#BlackyMan
+#AIHouse
+
+
+============================================================
+8. MEMORY-COMPACT VERSION
+============================================================
+
+ควรเก็บ memory แบบ compact เฉพาะแกน logic ดังนี้:
+
+Local AI model selection ต้องประเมิน 2 เรื่องเสมอ:
+1) โมเดล fit กับ VRAM/RAM/context หรือไม่
+2) โมเดลเร็วพอสำหรับงานจริงหรือไม่
+
+ค่าเริ่มต้นสำหรับ GGUF บน llama.cpp คือ Q4_K_M
+ถ้า VRAM เหลือค่อยลอง Q5/Q6
+ถ้า VRAM ไม่พอให้ลอง IQ หรือ Unsloth dynamic
+หลีกเลี่ยง Q3/Q2 เว้นแต่จำเป็น
+
+Dense model ต้องการ VRAM สูงและ offload แล้วช้ามาก
+MoE model ต้องดู active parameters ไม่ใช่ total parameters
+MoE active parameter ต่ำสามารถรันโมเดลใหญ่บน GPU เล็กได้
+โดยใช้ CPU/RAM offload
+
+สำหรับ llama.cpp MoE offload:
+attention layer ควรอยู่ GPU
+expert layer ควรอยู่ CPU/RAM
+RAM bandwidth สำคัญมาก รองลงมาคือ CPU และ PCIe สำคัญน้อยกว่า
+
+Wrapper เช่น Ollama/LM Studio เหมาะกับเริ่มต้น
+แต่ถ้าต้อง optimize จริงควรลงไปใช้ llama.cpp โดยตรง
+ใช้ NGL สำหรับ split ง่าย
+ใช้ tensor override สำหรับ placement ละเอียด
+
+ก่อนซื้อ hardware ต้องลองเครื่องที่มีอยู่ก่อน
+ถ้า dense path ให้ซื้อ VRAM
+ถ้า MoE offload path ให้ balance VRAM + RAM เร็ว + CPU ดี
+ไม่ควรเลือก GPU จาก VRAM อย่างเดียว
+
+END OF SkR00 DRAFT
